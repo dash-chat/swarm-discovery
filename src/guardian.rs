@@ -195,7 +195,9 @@ pub async fn guardian(
                         if let ReceiverSocket::Interface(addr) = which {
                             interface_receivers.insert(IpAddr::V4(*addr), receiver_ref);
                         }
-                        tracing::info!("Restarted {} on a fresh socket", which.actor_name());
+                        // Warn rather than info: it is rare, and what tells a recovery apart
+                        // from a discoverer that stopped for good in logs that only keep warnings.
+                        tracing::warn!("Restarted {} on a fresh socket", which.actor_name());
                     }
                     Ok(None) => {}
                     Err(e) => {
