@@ -258,8 +258,8 @@ pub fn socket_v6() -> Result<UdpSocket, SocketError> {
 
 #[derive(Clone, Debug)]
 pub struct Sockets {
-    v4: Option<Arc<UdpSocket>>,
-    v6: Option<Arc<UdpSocket>>,
+    v4: Arc<RwLock<Option<Arc<UdpSocket>>>>,
+    v6: Arc<RwLock<Option<Arc<UdpSocket>>>>,
     interface_sockets_v4: Arc<RwLock<HashMap<Ipv4Addr, Arc<UdpSocket>>>>,
 }
 
@@ -282,25 +282,30 @@ impl Sockets {
 
         let sockets = match class {
             IpClass::Auto => {
-                let socket = Self {
-                    v4: socket_v4(None).ok().map(Arc::new),
-                    v6: socket_v6().ok().map(Arc::new),
-                    interface_sockets_v4: interface_sockets_v4.clone(),
-                };
-                if socket.v4.is_none() && socket.v6.is_none() {
+                let v4 = socket_v4(None).ok().map(Arc::new);
+                let v6 = socket_v6().ok().map(Arc::new);
+                if v4.is_none() && v6.is_none() {
                     return Err(SocketError::CannotBind);
                 }
-                socket
+                Self {
+                    v4: Arc::new(RwLock::new(v4)),
+                    v6: Arc::new(RwLock::new(v6)),
+                    interface_sockets_v4: interface_sockets_v4.clone(),
+                }
             }
             _ => Self {
-                v4: class
-                    .has_v4()
-                    .then(|| socket_v4(None).map(Arc::new))
-                    .transpose()?,
-                v6: class
-                    .has_v6()
-                    .then(|| socket_v6().map(Arc::new))
-                    .transpose()?,
+                v4: Arc::new(RwLock::new(
+                    class
+                        .has_v4()
+                        .then(|| socket_v4(None).map(Arc::new))
+                        .transpose()?,
+                )),
+                v6: Arc::new(RwLock::new(
+                    class
+                        .has_v6()
+                        .then(|| socket_v6().map(Arc::new))
+                        .transpose()?,
+                )),
                 interface_sockets_v4: interface_sockets_v4.clone(),
             },
         };
@@ -311,11 +316,58 @@ impl Sockets {
     }
 
     pub fn v4(&self) -> Option<Arc<UdpSocket>> {
-        self.v4.as_ref().map(Arc::clone)
+        self.v4.read().unwrap().clone()
     }
 
     pub fn v6(&self) -> Option<Arc<UdpSocket>> {
-        self.v6.as_ref().map(Arc::clone)
+        self.v6.read().unwrap().clone()
+    }
+
+    /// Replaces the wildcard IPv4 socket with a freshly bound one, joined to
+    /// the multicast group on every interface the old one was.
+    ///
+    /// For when the OS has torn the old socket down underneath us, as iOS does
+    /// to the sockets of a suspended app.
+    pub fn rebind_v4(&self) -> Result<Arc<UdpSocket>, SocketError> {
+        let socket = Arc::new(socket_v4(None)?);
+        *self.v4.write().unwrap() = Some(socket.clone());
+        for addr in self.get_all_interface_addresses_v4() {
+            self.join_group_on_main_v4(addr);
+        }
+        Ok(socket)
+    }
+
+    /// Replaces the wildcard IPv6 socket with a freshly bound one. See
+    /// [`Self::rebind_v4`].
+    pub fn rebind_v6(&self) -> Result<Arc<UdpSocket>, SocketError> {
+        let socket = Arc::new(socket_v6()?);
+        *self.v6.write().unwrap() = Some(socket.clone());
+        Ok(socket)
+    }
+
+    /// Replaces the socket of IPv4 interface `addr` with a freshly bound one,
+    /// or returns `None` if the interface has been removed meanwhile. See
+    /// [`Self::rebind_v4`].
+    pub fn rebind_interface_v4(
+        &self,
+        addr: Ipv4Addr,
+    ) -> Result<Option<Arc<UdpSocket>>, SocketError> {
+        if !self
+            .interface_sockets_v4
+            .read()
+            .unwrap()
+            .contains_key(&addr)
+        {
+            return Ok(None);
+        }
+        let socket = Arc::new(socket_v4(Some(addr))?);
+        let mut interfaces = self.interface_sockets_v4.write().unwrap();
+        // need to recheck since we dropped the lock in between
+        if !interfaces.contains_key(&addr) {
+            return Ok(None);
+        }
+        interfaces.insert(addr, socket.clone());
+        Ok(Some(socket))
     }
 
     /// Joins the multicast group on the given interface on the main wildcard
@@ -331,7 +383,7 @@ impl Sockets {
     /// per interface on the wildcard socket makes reception work on all
     /// interfaces.
     fn join_group_on_main_v4(&self, addr: Ipv4Addr) {
-        if let Some(v4) = &self.v4 {
+        if let Some(v4) = self.v4() {
             match v4.join_multicast_v4(MDNS_IPV4, addr) {
                 Ok(()) => tracing::debug!("joined multicast group on interface {}", addr),
                 // Already being a member on this interface (e.g. the default
@@ -344,7 +396,7 @@ impl Sockets {
     /// Leaves the multicast group on the given interface on the main wildcard
     /// IPv4 socket. See [`Self::join_group_on_main_v4`].
     fn leave_group_on_main_v4(&self, addr: Ipv4Addr) {
-        if let Some(v4) = &self.v4 {
+        if let Some(v4) = self.v4() {
             if let Err(e) = v4.leave_multicast_v4(MDNS_IPV4, addr) {
                 tracing::debug!("could not leave multicast group on {}: {}", addr, e);
             }
@@ -435,7 +487,7 @@ impl Sockets {
 
             // If mode is Any, also send on IPv6 if available
             if matches!(mode, Mode::Any) {
-                if let Some(v6) = &self.v6 {
+                if let Some(v6) = self.v6() {
                     if let Err(e) = v6.send_to(&bytes, (MDNS_IPV6, MDNS_PORT)).await {
                         tracing::warn!("error sending mDNS on IPv6: {}", e);
                     } else {
@@ -452,13 +504,13 @@ impl Sockets {
         } else {
             // Single interface mode or IPv6-only
             let (socket, addr) = match mode {
-                Mode::V4 => (self.v4.as_ref().unwrap(), IpAddr::from(MDNS_IPV4)),
-                Mode::V6 => (self.v6.as_ref().unwrap(), IpAddr::from(MDNS_IPV6)),
+                Mode::V4 => (self.v4().unwrap(), IpAddr::from(MDNS_IPV4)),
+                Mode::V6 => (self.v6().unwrap(), IpAddr::from(MDNS_IPV6)),
                 Mode::Any => {
-                    if let Some(v4) = &self.v4 {
+                    if let Some(v4) = self.v4() {
                         (v4, IpAddr::from(MDNS_IPV4))
                     } else {
-                        (self.v6.as_ref().unwrap(), IpAddr::from(MDNS_IPV6))
+                        (self.v6().unwrap(), IpAddr::from(MDNS_IPV6))
                     }
                 }
             };

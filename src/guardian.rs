@@ -1,13 +1,26 @@
 use crate::{
     receiver::{receiver, ReceiverError},
-    sender::{self, sender},
-    socket::Sockets,
+    sender::{self, sender, MdnsMsg},
+    socket::{SocketError, Sockets},
     updater::updater,
     Discoverer,
 };
-use acto::{AcTokioRuntime, ActoCell, ActoInput, ActoRef};
+use acto::{AcTokioRuntime, ActoCell, ActoId, ActoInput, ActoRef};
 use hickory_proto::rr::Name;
-use std::{collections::HashMap, mem::replace, net::IpAddr};
+use std::{
+    collections::HashMap,
+    mem::replace,
+    net::{IpAddr, Ipv4Addr},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::net::UdpSocket;
+
+type GuardianCell = ActoCell<Input, AcTokioRuntime, Result<(), ReceiverError>>;
+
+/// How long to wait before replacing the socket of a failed receiver, so that a
+/// socket which keeps failing cannot spin the guardian.
+const RECEIVER_RESTART_DELAY: Duration = Duration::from_secs(1);
 
 pub enum Input {
     RemoveAll,
@@ -18,10 +31,64 @@ pub enum Input {
     RemoveTxt(String),
     AddInterface(IpAddr),
     RemoveInterface(IpAddr),
+    RestartReceiver(ReceiverSocket),
+}
+
+/// The socket a receiver listens on.
+#[derive(Clone, Copy, Debug)]
+pub enum ReceiverSocket {
+    V4,
+    V6,
+    Interface(Ipv4Addr),
+}
+
+impl ReceiverSocket {
+    fn actor_name(self) -> String {
+        match self {
+            ReceiverSocket::V4 => "receiver_v4".to_string(),
+            ReceiverSocket::V6 => "receiver_v6".to_string(),
+            ReceiverSocket::Interface(addr) => format!("receiver_interface_{}", addr),
+        }
+    }
+
+    /// Binds a fresh socket in place of this one, or returns `None` if it is
+    /// gone for good (a removed interface).
+    fn rebind(self, sockets: &Sockets) -> Result<Option<Arc<UdpSocket>>, SocketError> {
+        match self {
+            ReceiverSocket::V4 => sockets.rebind_v4().map(Some),
+            ReceiverSocket::V6 => sockets.rebind_v6().map(Some),
+            ReceiverSocket::Interface(addr) => sockets.rebind_interface_v4(addr),
+        }
+    }
+}
+
+/// Spawns receivers and remembers which socket each one listens on, so that a
+/// failed one can be restarted on a fresh socket.
+struct Receivers {
+    sockets: HashMap<ActoId, ReceiverSocket>,
+    service_name: Name,
+    sender: ActoRef<MdnsMsg>,
+}
+
+impl Receivers {
+    fn spawn(
+        &mut self,
+        ctx: &mut GuardianCell,
+        which: ReceiverSocket,
+        socket: Arc<UdpSocket>,
+    ) -> ActoRef<()> {
+        let service_name = self.service_name.clone();
+        let sender = self.sender.clone();
+        let receiver_ref = ctx.spawn_supervised(&which.actor_name(), move |ctx| {
+            receiver(ctx, service_name, socket, sender)
+        });
+        self.sockets.insert(receiver_ref.id(), which);
+        receiver_ref
+    }
 }
 
 pub async fn guardian(
-    mut ctx: ActoCell<Input, AcTokioRuntime, Result<(), ReceiverError>>,
+    mut ctx: GuardianCell,
     mut discoverer: Discoverer,
     sockets: Sockets,
     service_name: Name,
@@ -43,20 +110,18 @@ pub async fn guardian(
         .map_handle(Ok),
     );
 
+    let mut receivers = Receivers {
+        sockets: HashMap::new(),
+        service_name,
+        sender: snd_ref.clone(),
+    };
+
     if let Some(v4) = sockets2.v4() {
-        let service_name = service_name.clone();
-        let snd_ref = snd_ref.clone();
-        ctx.spawn_supervised("receiver_v4", move |ctx| {
-            receiver(ctx, service_name, v4, snd_ref)
-        });
+        receivers.spawn(&mut ctx, ReceiverSocket::V4, v4);
     }
 
     if let Some(v6) = sockets2.v6() {
-        let service_name = service_name.clone();
-        let snd_ref = snd_ref.clone();
-        ctx.spawn_supervised("receiver_v6", move |ctx| {
-            receiver(ctx, service_name, v6, snd_ref)
-        });
+        receivers.spawn(&mut ctx, ReceiverSocket::V6, v6);
     }
 
     // Track interface receivers so we can stop them when interfaces are removed
@@ -66,13 +131,7 @@ pub async fn guardian(
     let initial_interfaces = sockets2.get_all_interface_addresses_v4();
     for addr in initial_interfaces {
         if let Some(socket) = sockets2.get_interface_socket_v4(addr) {
-            let service_name = service_name.clone();
-            let snd_ref = snd_ref.clone();
-            let addr_str = addr.to_string();
-            let receiver_ref = ctx
-                .spawn_supervised(&format!("receiver_interface_{}", addr_str), move |ctx| {
-                    receiver(ctx, service_name, socket, snd_ref)
-                });
+            let receiver_ref = receivers.spawn(&mut ctx, ReceiverSocket::Interface(addr), socket);
             interface_receivers.insert(IpAddr::V4(addr), receiver_ref);
             tracing::info!("Started receiver for initial interface {}", addr);
         }
@@ -87,7 +146,14 @@ pub async fn guardian(
                 match result {
                     Ok(Ok(_)) => tracing::warn!("actor {:?} ({}) stopped", id, name),
                     Ok(Err(e)) => {
-                        tracing::warn!("actor {:?} ({}) failed: {}", id, name, e)
+                        tracing::warn!("actor {:?} ({}) failed: {}", id, name, e);
+                        // The OS can tear a socket down underneath us (iOS does
+                        // to a suspended app's): bind a fresh one instead of
+                        // giving up on discovery.
+                        if let Some(which) = receivers.sockets.remove(&id) {
+                            restart_receiver_later(&mut ctx, which);
+                            continue;
+                        }
                     }
                     Err(e) => {
                         tracing::warn!("actor {:?} ({}) aborted: {}", id, name, e);
@@ -103,12 +169,10 @@ pub async fn guardian(
                         } else {
                             // Start a receiver for the new interface socket
                             if let Some(socket) = sockets2.get_interface_socket_v4(*ipv4) {
-                                let service_name = service_name.clone();
-                                let snd_ref = snd_ref.clone();
-                                let addr_str = addr.to_string();
-                                let receiver_ref = ctx.spawn_supervised(
-                                    &format!("receiver_interface_{}", addr_str),
-                                    move |ctx| receiver(ctx, service_name, socket, snd_ref),
+                                let receiver_ref = receivers.spawn(
+                                    &mut ctx,
+                                    ReceiverSocket::Interface(*ipv4),
+                                    socket,
                                 );
                                 interface_receivers.insert(*addr, receiver_ref);
                                 tracing::info!("Started receiver for interface {}", addr);
@@ -125,10 +189,32 @@ pub async fn guardian(
                         }
                     }
                 }
+                Input::RestartReceiver(which) => match which.rebind(&sockets2) {
+                    Ok(Some(socket)) => {
+                        let receiver_ref = receivers.spawn(&mut ctx, *which, socket);
+                        if let ReceiverSocket::Interface(addr) = which {
+                            interface_receivers.insert(IpAddr::V4(*addr), receiver_ref);
+                        }
+                        tracing::info!("Restarted {} on a fresh socket", which.actor_name());
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!("Failed to rebind {}: {}", which.actor_name(), e);
+                        restart_receiver_later(&mut ctx, *which);
+                    }
+                },
                 _ => {
                     snd_ref.send(sender::MdnsMsg::Update(msg));
                 }
             },
         }
     }
+}
+
+fn restart_receiver_later(ctx: &mut GuardianCell, which: ReceiverSocket) {
+    let me = ctx.me();
+    tokio::spawn(async move {
+        tokio::time::sleep(RECEIVER_RESTART_DELAY).await;
+        me.send(Input::RestartReceiver(which));
+    });
 }
